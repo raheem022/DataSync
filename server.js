@@ -4,6 +4,10 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
+import rateLimit from 'express-rate-limit';
+import slowDown from 'express-slow-down';
+import helmet from 'helmet';
+import compression from 'compression';
 
 // Get current directory for ES modules
 const __filename = fileURLToPath(import.meta.url);
@@ -30,6 +34,173 @@ const app = express();
 
 // Use environment variable for port, with fallback
 const port = process.env.PORT || 8081;
+
+// =============================================================================
+// CRASH PREVENTION AND LOAD PROTECTION MIDDLEWARE
+// =============================================================================
+
+// Global uncaught exception handler - PREVENT SERVER CRASH
+process.on('uncaughtException', (error) => {
+  console.error('💥 UNCAUGHT EXCEPTION - Server continuing...', error);
+  console.error('Stack:', error.stack);
+  // Don't exit - keep server running
+});
+
+// Global unhandled promise rejection handler - PREVENT SERVER CRASH
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('💥 UNHANDLED PROMISE REJECTION - Server continuing...', reason);
+  console.error('Promise:', promise);
+  // Don't exit - keep server running
+});
+
+// Trust proxy for rate limiting behind load balancers
+app.set('trust proxy', 1);
+
+// Security middleware - protect against attacks
+app.use(helmet({
+  contentSecurityPolicy: false, // Allow flexible CSP for development
+  crossOriginEmbedderPolicy: false
+}));
+
+// Compression middleware - reduce response size
+app.use(compression());
+
+// Rate limiting middleware - PREVENT REQUEST FLOODING
+const generalRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: isProduction ? 100 : 200, // Max requests per window
+  message: {
+    error: 'Too many requests from this IP, please try again later.',
+    retryAfter: '15 minutes'
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => {
+    // Skip rate limiting for health checks
+    return req.path === '/health' || req.path === '/';
+  }
+});
+
+// Strict rate limiting for auth endpoints - PREVENT BRUTE FORCE
+const authRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // Only 10 login attempts per window
+  message: {
+    error: 'Too many login attempts, please try again later.',
+    retryAfter: '15 minutes'
+  },
+  skipSuccessfulRequests: true
+});
+
+// Speed limiter - SLOW DOWN RAPID REQUESTS
+const speedLimiter = slowDown({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  delayAfter: 50, // Allow 50 requests per window at full speed
+  delayMs: 100, // Add 100ms delay per request after limit
+  maxDelayMs: 2000, // Maximum delay of 2 seconds
+  skip: (req) => {
+    // Skip for health checks and static assets
+    return req.path === '/health' || req.path === '/';
+  }
+});
+
+// Apply rate limiting globally
+app.use(generalRateLimit);
+app.use(speedLimiter);
+
+// Memory monitoring and protection
+let memoryWarningCount = 0;
+const MEMORY_THRESHOLD = 500 * 1024 * 1024; // 500MB threshold
+
+setInterval(() => {
+  const memoryUsage = process.memoryUsage();
+  const heapUsed = memoryUsage.heapUsed;
+  
+  if (heapUsed > MEMORY_THRESHOLD) {
+    memoryWarningCount++;
+    console.warn(`⚠️ HIGH MEMORY USAGE: ${Math.round(heapUsed / 1024 / 1024)}MB`);
+    
+    if (memoryWarningCount > 5) {
+      console.warn('🧹 Attempting garbage collection...');
+      if (global.gc) {
+        global.gc();
+        memoryWarningCount = 0;
+      }
+    }
+  } else {
+    memoryWarningCount = 0;
+  }
+}, 30000); // Check every 30 seconds
+
+// Request timeout middleware - PREVENT HANGING REQUESTS
+app.use((req, res, next) => {
+  // Set timeout for all requests
+  req.setTimeout(30000, () => {
+    console.warn(`⏱️ Request timeout: ${req.method} ${req.path}`);
+    if (!res.headersSent) {
+      res.status(408).json({
+        success: false,
+        error: 'Request timeout - please try again'
+      });
+    }
+  });
+  next();
+});
+
+// Global error handling middleware - CATCH ALL ERRORS
+const globalErrorHandler = (error, req, res, next) => {
+  console.error('🚨 GLOBAL ERROR HANDLER:', {
+    error: error.message,
+    stack: error.stack,
+    path: req.path,
+    method: req.method,
+    ip: req.ip,
+    timestamp: new Date().toISOString()
+  });
+  
+  // Don't crash - always respond
+  if (!res.headersSent) {
+    res.status(500).json({
+      success: false,
+      error: isProduction 
+        ? 'Internal server error - please try again later'
+        : error.message
+    });
+  }
+};
+
+// Database connection monitoring and retry logic
+let connectionRetryCount = 0;
+const MAX_CONNECTION_RETRIES = 5;
+
+async function withRetry(operation, maxRetries = 3, delay = 1000) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await operation();
+    } catch (error) {
+      console.warn(`Retry attempt ${i + 1}/${maxRetries} failed:`, error.message);
+      if (i === maxRetries - 1) throw error;
+      await new Promise(resolve => setTimeout(resolve, delay * Math.pow(2, i)));
+    }
+  }
+}
+
+// Database health check and reconnection
+const checkDatabaseHealth = async () => {
+  for (const [dbKey, pool] of Object.entries(pools)) {
+    try {
+      if (pool && !pool.connected) {
+        console.warn(`🔄 Reconnecting to ${databases[dbKey].database}...`);
+        await pool.connect();
+      }
+    } catch (error) {
+      console.error(`❌ Database health check failed for ${dbKey}:`, error.message);
+    }
+  }
+};
+
+// Check database health every 2 minutes
+setInterval(checkDatabaseHealth, 120000);
 
 // CORS configuration for production
 const corsOptions = {
@@ -80,9 +251,15 @@ const baseDbConfig = {
     requestTimeout: 30000,
   },
   pool: {
-    max: process.env.NODE_ENV === 'production' ? 20 : 10,
-    min: 0,
+    max: process.env.NODE_ENV === 'production' ? 50 : 20, // Increased for better multi-user support
+    min: 5, // Maintain minimum connections
     idleTimeoutMillis: 30000,
+    acquireTimeoutMillis: 30000, // Timeout for getting connection from pool
+    createTimeoutMillis: 30000, // Timeout for creating new connection
+    destroyTimeoutMillis: 5000,
+    reapIntervalMillis: 1000, // How often to check for idle connections
+    createRetryIntervalMillis: 200, // Retry interval for failed connections
+    validateConnection: true, // Validate connections before use
   },
 };
 
@@ -578,7 +755,7 @@ app.get('/api/customers', async (req, res) => {
 
 /**
  * GET /api/mobile/customers/allocated
- * Get customers allocated to the authenticated mobile user from Phase 4 customer_allocations table
+ * Get OPEN customers allocated to the authenticated mobile user (excludes closed customers from home list)
  */
 app.get('/api/mobile/customers/allocated', async (req, res) => {
   try {
@@ -595,54 +772,99 @@ app.get('/api/mobile/customers/allocated', async (req, res) => {
       });
     }
     
-    console.log(`🔍 Fetching allocated customers for user: ${tokenData.username} (ID: ${tokenData.userId})`);
+    console.log(`🔍 Fetching OPEN allocated customers for user: ${tokenData.username} (ID: ${tokenData.userId})`);
     
     // Use main database 
     const mainPool = pools.main;
-    const { page = 1, size = 50 } = req.query;
+    const { page = 1, size = 50, include_closed = false } = req.query;
     
-    // Try customer_allocations table first, fallback to customers.assigned_to
-    let query, result, totalCount;
+    // Query to get allocated customers (OPEN only for home list, unless include_closed=true)
+    let query = `
+      SELECT 
+        id, firstname, mobilenumber, city, state,
+        customeremailaddress, registrationnum, vehiclemake, 
+        vehmodel, created_at, updated_at,
+        customer_status, is_closed, last_status_updated, reminder_date,
+        updated_at as allocated_at, 'ASSIGNED' as allocation_status, 
+        'Assigned via legacy system' as allocation_notes
+      FROM customers
+      WHERE assigned_to = @userId
+    `;
     
-    // Skip customer_allocations table and use customers.assigned_to directly
-    // This is needed because Phase 4 allocated customers using assigned_to field
-    console.log('🔄 Using customers.assigned_to field directly (Phase 4 compatibility)');
+    // Filter logic based on the 5-status system
+    if (include_closed !== 'true') {
+      // Default: Only show OPEN customers (not_reachable, follow_up, not_started)
+      // Exclude CLOSED customers (active, renewed, not_interested)
+      query += ` AND (is_closed = 0 OR is_closed IS NULL)`;
+      console.log('📂 Filtering to show OPEN customers only (excluding closed)');
+    } else {
+      console.log('📁 Including ALL customers (open and closed)');
+    }
     
-    // Use customers.assigned_to field
-      query = `
-        SELECT 
-          id, firstname, mobilenumber, city, state,
-          customeremailaddress, registrationnum, vehiclemake, 
-          vehmodel, created_at, updated_at,
-          updated_at as allocated_at, 'ASSIGNED' as allocation_status, 
-          'Assigned via legacy system' as allocation_notes
-        FROM customers
-        WHERE assigned_to = @userId
-        ORDER BY updated_at DESC
-        OFFSET @offset ROWS 
-        FETCH NEXT @pageSize ROWS ONLY
-      `;
-      
-      const request = mainPool.request();
-      request.input('userId', sql.BigInt, tokenData.userId);
-      request.input('offset', sql.Int, (page - 1) * size);
-      request.input('pageSize', sql.Int, size);
-      
-      result = await request.query(query);
-      
-      // Get total count
-      const countQuery = `
-        SELECT COUNT(*) as total
-        FROM customers
-        WHERE assigned_to = @userId
-      `;
-      
-      const countRequest = mainPool.request();
-      countRequest.input('userId', sql.BigInt, tokenData.userId);
-      const countResult = await countRequest.query(countQuery);
-      totalCount = countResult.recordset[0].total;
-      
-      console.log(`✅ Found ${result.recordset.length} allocated customers via customers.assigned_to fallback`);
+    // Handle reminder dates for follow_up customers
+    if (include_closed !== 'true') {
+      query += ` AND (
+        customer_status != 'follow_up' OR 
+        reminder_date IS NULL OR 
+        reminder_date <= GETDATE()
+      )`;
+    }
+    
+    query += ` 
+      ORDER BY 
+        CASE 
+          WHEN customer_status = 'follow_up' AND reminder_date IS NOT NULL THEN reminder_date
+          ELSE last_status_updated 
+        END DESC
+      OFFSET @offset ROWS 
+      FETCH NEXT @pageSize ROWS ONLY
+    `;
+    
+    const request = mainPool.request();
+    request.input('userId', sql.BigInt, tokenData.userId);
+    request.input('offset', sql.Int, (page - 1) * size);
+    request.input('pageSize', sql.Int, size);
+    
+    const result = await request.query(query);
+    
+    // Get total count with same filtering
+    let countQuery = `
+      SELECT COUNT(*) as total
+      FROM customers
+      WHERE assigned_to = @userId
+    `;
+    
+    if (include_closed !== 'true') {
+      countQuery += ` AND (is_closed = 0 OR is_closed IS NULL)`;
+      countQuery += ` AND (
+        customer_status != 'follow_up' OR 
+        reminder_date IS NULL OR 
+        reminder_date <= GETDATE()
+      )`;
+    }
+    
+    const countRequest = mainPool.request();
+    countRequest.input('userId', sql.BigInt, tokenData.userId);
+    const countResult = await countRequest.query(countQuery);
+    const totalCount = countResult.recordset[0].total;
+    
+    // Get status breakdown for additional info
+    const statusQuery = `
+      SELECT 
+        customer_status,
+        is_closed,
+        COUNT(*) as count
+      FROM customers
+      WHERE assigned_to = @userId
+      GROUP BY customer_status, is_closed
+      ORDER BY customer_status
+    `;
+    
+    const statusRequest = mainPool.request();
+    statusRequest.input('userId', sql.BigInt, tokenData.userId);
+    const statusResult = await statusRequest.query(statusQuery);
+    
+    console.log(`✅ Found ${result.recordset.length} ${include_closed === 'true' ? 'total' : 'OPEN'} allocated customers`);
     
     res.json({
       success: true,
@@ -658,6 +880,20 @@ app.get('/api/mobile/customers/allocated', async (req, res) => {
           username: tokenData.username,
           user_id: tokenData.userId,
           state: tokenData.state
+        },
+        filter_info: {
+          include_closed: include_closed === 'true',
+          showing: include_closed === 'true' ? 'All customers' : 'Open customers only',
+          closed_statuses: ['active', 'renewed', 'not_interested'],
+          open_statuses: ['not_reachable', 'follow_up', 'not_started']
+        },
+        status_breakdown: statusResult.recordset,
+        system_info: {
+          status_rules: {
+            closed: 'active, renewed, not_interested → removed from home list',
+            open: 'not_reachable, follow_up → remain in home list',
+            reminder: 'follow_up customers with future reminder dates are hidden until due'
+          }
         }
       }
     });
@@ -671,10 +907,436 @@ app.get('/api/mobile/customers/allocated', async (req, res) => {
 });
 
 /**
+ * PATCH /api/mobile/customers/:id/status
+ * Update customer status using the new 5-status system with closure logic
+ */
+app.patch('/api/mobile/customers/:id/status', async (req, res) => {
+  try {
+    console.log('📱 Mobile customer status update request received');
+    
+    // Extract and validate token
+    const authHeader = req.headers.authorization;
+    const tokenData = decodeToken(authHeader);
+    
+    if (!tokenData) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid or expired authentication token'
+      });
+    }
+    
+    const customerId = req.params.id;
+    const { status, notes, reminder_date } = req.body;
+    
+    if (!status) {
+      return res.status(400).json({
+        success: false,
+        error: 'Status is required'
+      });
+    }
+    
+    // Validate the 5 allowed statuses
+    const validStatuses = ['active', 'renewed', 'not_interested', 'not_reachable', 'follow_up'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid status. Must be one of: ${validStatuses.join(', ')}`
+      });
+    }
+    
+    // Determine if customer should be closed based on status
+    const closedStatuses = ['active', 'renewed', 'not_interested'];
+    const isClosed = closedStatuses.includes(status);
+    
+    // Validate reminder_date for follow_up status
+    if (status === 'follow_up' && reminder_date) {
+      const reminderDate = new Date(reminder_date);
+      if (isNaN(reminderDate.getTime()) || reminderDate <= new Date()) {
+        return res.status(400).json({
+          success: false,
+          error: 'Reminder date must be a valid future date for follow-up status'
+        });
+      }
+    }
+    
+    console.log(`🔄 Updating customer ${customerId} status to: ${status} (closed: ${isClosed}) by user: ${tokenData.username}`);
+    
+    // Try to update in state database first (if user has a state)
+    let stateUpdateSuccess = false;
+    const stateDbKey = getStateDbKey(tokenData.state);
+    
+    if (stateDbKey && pools[stateDbKey]) {
+      try {
+        const statePool = pools[stateDbKey];
+        const stateQuery = `
+          UPDATE customers 
+          SET 
+            CustomerStatus = @status,
+            IsClosed = @isClosed,
+            LastStatusUpdated = GETDATE(),
+            StatusUpdatedBy = @userId,
+            Notes = CASE 
+              WHEN @notes IS NOT NULL THEN @notes 
+              ELSE Notes 
+            END,
+            ReminderDate = @reminderDate,
+            UpdatedAt = GETDATE(),
+            updated_by = @userId
+          WHERE (Id = @customerId OR SourceCustomerId = @customerId) 
+            AND assigned_to = @userId
+        `;
+        
+        const stateRequest = statePool.request();
+        stateRequest.input('status', sql.NVarChar, status);
+        stateRequest.input('isClosed', sql.Bit, isClosed);
+        stateRequest.input('notes', sql.NVarChar, notes || null);
+        stateRequest.input('reminderDate', sql.DateTime2, reminder_date || null);
+        stateRequest.input('userId', sql.BigInt, tokenData.userId);
+        stateRequest.input('customerId', sql.BigInt, customerId);
+        
+        const stateResult = await stateRequest.query(stateQuery);
+        stateUpdateSuccess = stateResult.rowsAffected[0] > 0;
+        
+        if (stateUpdateSuccess) {
+          console.log(`✅ Updated customer status in state database: ${databases[stateDbKey].database}`);
+        }
+      } catch (error) {
+        console.warn(`⚠️ Failed to update in state database: ${error.message}`);
+      }
+    }
+    
+    // Also update in main database for consistency
+    const mainPool = pools.main;
+    const mainQuery = `
+      UPDATE customers 
+      SET 
+        customer_status = @status,
+        is_closed = @isClosed,
+        last_status_updated = GETDATE(),
+        status_updated_by = @userId,
+        notes = CASE 
+          WHEN @notes IS NOT NULL THEN @notes 
+          ELSE notes 
+        END,
+        reminder_date = @reminderDate,
+        updated_at = GETDATE(),
+        updated_by = @userId
+      WHERE id = @customerId AND assigned_to = @userId
+    `;
+    
+    const mainRequest = mainPool.request();
+    mainRequest.input('status', sql.NVarChar, status);
+    mainRequest.input('isClosed', sql.Bit, isClosed);
+    mainRequest.input('notes', sql.NText, notes || null);
+    mainRequest.input('reminderDate', sql.DateTime2, reminder_date || null);
+    mainRequest.input('userId', sql.BigInt, tokenData.userId);
+    mainRequest.input('customerId', sql.BigInt, customerId);
+    
+    const mainResult = await mainRequest.query(mainQuery);
+    const mainUpdateSuccess = mainResult.rowsAffected[0] > 0;
+    
+    if (!mainUpdateSuccess && !stateUpdateSuccess) {
+      return res.status(404).json({
+        success: false,
+        error: 'Customer not found or not assigned to this user'
+      });
+    }
+    
+    console.log(`✅ Customer status update completed - Main DB: ${mainUpdateSuccess}, State DB: ${stateUpdateSuccess}`);
+    
+    // Log the action
+    if (isClosed) {
+      console.log(`🔒 Customer ${customerId} marked as CLOSED with status: ${status}`);
+    } else {
+      console.log(`📂 Customer ${customerId} remains OPEN with status: ${status}`);
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        customer_id: customerId,
+        status: status,
+        is_closed: isClosed,
+        reminder_date: reminder_date || null,
+        updated_by: tokenData.username,
+        main_db_updated: mainUpdateSuccess,
+        state_db_updated: stateUpdateSuccess,
+        database_used: stateUpdateSuccess ? databases[stateDbKey].database : 'main',
+        closure_info: {
+          closed_statuses: closedStatuses,
+          open_statuses: ['not_reachable', 'follow_up'],
+          action_taken: isClosed ? 'Customer removed from home list' : 'Customer remains in home list'
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Error updating customer status:', error);
+    res.status(500).json({
+      success: false,
+      error: `Failed to update customer status: ${error.message}`
+    });
+  }
+});
+
+/**
+ * GET /api/mobile/customers/follow-up
+ * Get customers due for follow-up based on reminder dates
+ */
+app.get('/api/mobile/customers/follow-up', async (req, res) => {
+  try {
+    console.log('📱 Mobile follow-up customers request received');
+    
+    // Extract and validate token
+    const authHeader = req.headers.authorization;
+    const tokenData = decodeToken(authHeader);
+    
+    if (!tokenData) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid or expired authentication token'
+      });
+    }
+    
+    console.log(`🔔 Fetching follow-up customers for user: ${tokenData.username} (ID: ${tokenData.userId})`);
+    
+    const mainPool = pools.main;
+    const { page = 1, size = 50, days_ahead = 7 } = req.query;
+    
+    // Get customers with follow_up status and reminder dates due within specified days
+    const query = `
+      SELECT 
+        id, firstname, mobilenumber, city, state,
+        customeremailaddress, registrationnum, vehiclemake, 
+        vehmodel, created_at, updated_at,
+        customer_status, is_closed, last_status_updated, reminder_date,
+        DATEDIFF(day, GETDATE(), reminder_date) as days_until_reminder
+      FROM customers
+      WHERE assigned_to = @userId
+        AND customer_status = 'follow_up'
+        AND reminder_date IS NOT NULL
+        AND reminder_date <= DATEADD(day, @daysAhead, GETDATE())
+        AND is_closed = 0
+      ORDER BY reminder_date ASC
+      OFFSET @offset ROWS 
+      FETCH NEXT @pageSize ROWS ONLY
+    `;
+    
+    const request = mainPool.request();
+    request.input('userId', sql.BigInt, tokenData.userId);
+    request.input('daysAhead', sql.Int, days_ahead);
+    request.input('offset', sql.Int, (page - 1) * size);
+    request.input('pageSize', sql.Int, size);
+    
+    const result = await request.query(query);
+    
+    // Get total count
+    const countQuery = `
+      SELECT COUNT(*) as total
+      FROM customers
+      WHERE assigned_to = @userId
+        AND customer_status = 'follow_up'
+        AND reminder_date IS NOT NULL
+        AND reminder_date <= DATEADD(day, @daysAhead, GETDATE())
+        AND is_closed = 0
+    `;
+    
+    const countRequest = mainPool.request();
+    countRequest.input('userId', sql.BigInt, tokenData.userId);
+    countRequest.input('daysAhead', sql.Int, days_ahead);
+    const countResult = await countRequest.query(countQuery);
+    const totalCount = countResult.recordset[0].total;
+    
+    console.log(`✅ Found ${result.recordset.length} follow-up customers due within ${days_ahead} days`);
+    
+    res.json({
+      success: true,
+      data: {
+        customers: result.recordset,
+        pagination: {
+          current_page: parseInt(page),
+          page_size: parseInt(size),
+          total_count: totalCount,
+          total_pages: Math.ceil(totalCount / size)
+        },
+        filter_info: {
+          days_ahead: parseInt(days_ahead),
+          showing: `Follow-up customers due within ${days_ahead} days`,
+          criteria: 'status = follow_up AND reminder_date <= today + days_ahead AND is_closed = false'
+        },
+        user_info: {
+          username: tokenData.username,
+          user_id: tokenData.userId,
+          state: tokenData.state
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching follow-up customers:', error);
+    res.status(500).json({
+      success: false,
+      error: `Failed to fetch follow-up customers: ${error.message}`
+    });
+  }
+});
+
+/**
+ * POST /api/mobile/customers/batch-status
+ * Batch update customer completion statuses for mobile users
+ */
+app.post('/api/mobile/customers/batch-status', async (req, res) => {
+  try {
+    console.log('📱 Mobile batch customer status update request received');
+    
+    // Extract and validate token
+    const authHeader = req.headers.authorization;
+    const tokenData = decodeToken(authHeader);
+    
+    if (!tokenData) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid or expired authentication token'
+      });
+    }
+    
+    const { updates } = req.body;
+    
+    if (!updates || !Array.isArray(updates) || updates.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Updates array is required and must not be empty'
+      });
+    }
+    
+    console.log(`🔄 Processing ${updates.length} customer status updates for user: ${tokenData.username}`);
+    
+    const results = {
+      successful: 0,
+      failed: 0,
+      details: []
+    };
+    
+    const stateDbKey = getStateDbKey(tokenData.state);
+    
+    // Process each update
+    for (const update of updates) {
+      const { customerId, status, notes } = update;
+      
+      if (!customerId || !status) {
+        results.failed++;
+        results.details.push({
+          customer_id: customerId,
+          status: 'failed',
+          error: 'Customer ID and status are required'
+        });
+        continue;
+      }
+      
+      try {
+        let updateSuccess = false;
+        
+        // Try state database first
+        if (stateDbKey && pools[stateDbKey]) {
+          try {
+            const statePool = pools[stateDbKey];
+            const stateQuery = `
+              UPDATE customers 
+              SET 
+                AssignedToStatus = @status,
+                Notes = CASE 
+                  WHEN @notes IS NOT NULL THEN @notes 
+                  ELSE Notes 
+                END,
+                UpdatedAt = GETDATE(),
+                updated_by = @userId
+              WHERE (Id = @customerId OR SourceCustomerId = @customerId)
+                AND (AssignedTo = @userIdStr OR assigned_to = @userId)
+            `;
+            
+            const stateRequest = statePool.request();
+            stateRequest.input('status', sql.NVarChar, status);
+            stateRequest.input('notes', sql.NVarChar, notes || null);
+            stateRequest.input('userId', sql.BigInt, tokenData.userId);
+            stateRequest.input('userIdStr', sql.NVarChar, tokenData.userId.toString());
+            stateRequest.input('customerId', sql.BigInt, customerId);
+            
+            const stateResult = await stateRequest.query(stateQuery);
+            updateSuccess = stateResult.rowsAffected[0] > 0;
+          } catch (error) {
+            console.warn(`⚠️ State DB update failed for customer ${customerId}: ${error.message}`);
+          }
+        }
+        
+        // Also try main database
+        if (!updateSuccess) {
+          const mainPool = pools.main;
+          const mainQuery = `
+            UPDATE customers 
+            SET 
+              processing_status = @status,
+              notes = CASE 
+                WHEN @notes IS NOT NULL THEN @notes 
+                ELSE notes 
+              END,
+              updated_at = GETDATE(),
+              updated_by = @userId
+            WHERE id = @customerId AND assigned_to = @userId
+          `;
+          
+          const mainRequest = mainPool.request();
+          mainRequest.input('status', sql.NVarChar, status.toUpperCase());
+          mainRequest.input('notes', sql.NText, notes || null);
+          mainRequest.input('userId', sql.BigInt, tokenData.userId);
+          mainRequest.input('customerId', sql.BigInt, customerId);
+          
+          const mainResult = await mainRequest.query(mainQuery);
+          updateSuccess = mainResult.rowsAffected[0] > 0;
+        }
+        
+        if (updateSuccess) {
+          results.successful++;
+          results.details.push({
+            customer_id: customerId,
+            status: 'success',
+            new_status: status
+          });
+        } else {
+          results.failed++;
+          results.details.push({
+            customer_id: customerId,
+            status: 'failed',
+            error: 'Customer not found or not assigned to this user'
+          });
+        }
+      } catch (error) {
+        results.failed++;
+        results.details.push({
+          customer_id: customerId,
+          status: 'failed',
+          error: error.message
+        });
+      }
+    }
+    
+    console.log(`✅ Batch update completed - Success: ${results.successful}, Failed: ${results.failed}`);
+    
+    res.json({
+      success: true,
+      data: results
+    });
+  } catch (error) {
+    console.error('Error in batch customer status update:', error);
+    res.status(500).json({
+      success: false,
+      error: `Failed to process batch status updates: ${error.message}`
+    });
+  }
+});
+
+/**
  * POST /api/auth/login
  * User authentication (Web/Admin)
  */
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', authRateLimit, async (req, res) => {
   try {
     const pool = await poolPromise;
     const { username, pin } = req.body;
@@ -746,7 +1408,7 @@ app.post('/api/auth/login', async (req, res) => {
  * POST /api/auth/mobile-login
  * Mobile app authentication (checks state-specific database)
  */
-app.post('/api/auth/mobile-login', async (req, res) => {
+app.post('/api/auth/mobile-login', authRateLimit, async (req, res) => {
   try {
     console.log('📱 Mobile login request received:', { username: req.body.username, state: req.body.state });
     
@@ -1324,5 +1986,8 @@ async function startServer() {
     process.exit(1);
   }
 }
+
+// Apply global error handler as final middleware
+app.use(globalErrorHandler);
 
 startServer();
