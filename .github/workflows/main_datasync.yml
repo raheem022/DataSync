@@ -11,7 +11,7 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     permissions:
       contents: read #This is required for actions/checkout
 
@@ -21,14 +21,14 @@ jobs:
       - name: Set up Node.js version
         uses: actions/setup-node@v3
         with:
-          node-version: '22.x'
+          node-version: '20.x'
 
       - name: npm install, build, and test
         run: |
           npm install
           npm run build --if-present
           npm run test --if-present
-      
+
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v4
         with:
@@ -51,13 +51,13 @@ jobs:
       - name: Login to Azure
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_B5D0A8304A57458AB16E86065EB8B1B8 }}
-          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_F277C0BC16034CCF97053914E5609DDD }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_08DECB884A4B43ED9B5FDC43F83E54D5 }}
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_410E11265D0F43D38531C9B906FE5F55 }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_53D99A2484974CF9AE1D5C5F86D480AF }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_4DA3D89FB5C64B059608992E067DFB96 }}
 
       - name: 'Deploy to Azure Web App'
-        uses: azure/webapps-deploy@v3
         id: deploy-to-webapp
+        uses: azure/webapps-deploy@v3
         with:
           app-name: 'DataSync'
           slot-name: 'Production'
