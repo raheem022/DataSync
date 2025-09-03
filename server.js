@@ -1001,7 +1001,11 @@ app.patch('/api/mobile/customers/:id/status', async (req, res) => {
             END,
             ReminderDate = @reminderDate,
             UpdatedAt = GETDATE(),
-            updated_by = @userId
+            updated_by = @userId,
+            assigned_to = CASE 
+              WHEN @isClosed = 1 THEN NULL 
+              ELSE assigned_to 
+            END
           WHERE (Id = @customerId OR SourceCustomerId = @customerId) 
             AND assigned_to = @userId
         `;
@@ -1027,6 +1031,8 @@ app.patch('/api/mobile/customers/:id/status', async (req, res) => {
     
     // Also update in main database for consistency
     const mainPool = pools.main;
+    
+    // For closed customers, unassign them so they don't appear in user's list anymore
     const mainQuery = `
       UPDATE customers 
       SET 
@@ -1040,7 +1046,11 @@ app.patch('/api/mobile/customers/:id/status', async (req, res) => {
         END,
         reminder_date = @reminderDate,
         updated_at = GETDATE(),
-        updated_by = @userId
+        updated_by = @userId,
+        assigned_to = CASE 
+          WHEN @isClosed = 1 THEN NULL 
+          ELSE assigned_to 
+        END
       WHERE id = @customerId AND assigned_to = @userId
     `;
     
@@ -1066,9 +1076,9 @@ app.patch('/api/mobile/customers/:id/status', async (req, res) => {
     
     // Log the action
     if (isClosed) {
-      console.log(`🔒 Customer ${customerId} marked as CLOSED with status: ${status}`);
+      console.log(`🔒 Customer ${customerId} marked as CLOSED with status: ${status} and UNASSIGNED from user`);
     } else {
-      console.log(`📂 Customer ${customerId} remains OPEN with status: ${status}`);
+      console.log(`📂 Customer ${customerId} remains OPEN with status: ${status} and stays assigned`);
     }
     
     res.json({
@@ -1085,7 +1095,7 @@ app.patch('/api/mobile/customers/:id/status', async (req, res) => {
         closure_info: {
           closed_statuses: closedStatuses,
           open_statuses: ['not_reachable', 'follow_up'],
-          action_taken: isClosed ? 'Customer removed from home list' : 'Customer remains in home list'
+          action_taken: isClosed ? 'Customer completed and unassigned from user' : 'Customer remains assigned to user'
         }
       }
     });
