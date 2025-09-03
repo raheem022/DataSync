@@ -259,7 +259,7 @@ const baseDbConfig = {
     destroyTimeoutMillis: 5000,
     reapIntervalMillis: 1000, // How often to check for idle connections
     createRetryIntervalMillis: 200, // Retry interval for failed connections
-    validateConnection: true, // Validate connections before use
+    // validateConnection: true, // Validate connections before use
   },
 };
 
@@ -1991,3 +1991,4 @@ async function startServer() {
 app.use(globalErrorHandler);
 
 startServer();
+
