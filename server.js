@@ -202,14 +202,34 @@ const checkDatabaseHealth = async () => {
 // Check database health every 2 minutes
 setInterval(checkDatabaseHealth, 120000);
 
-// CORS configuration for production
+// CORS configuration for production and development
+let allowedOrigins;
+if (process.env.NODE_ENV === 'production') {
+  // In production, use PROD_CORS_ORIGINS or fallback to CORS_ORIGINS
+  const corsEnvVar = process.env.PROD_CORS_ORIGINS || process.env.CORS_ORIGINS || '*';
+  allowedOrigins = corsEnvVar.split(',').map(origin => origin.trim());
+  
+  // Always allow localhost for development/testing in production
+  const localhostOrigins = [
+    'http://localhost:8080',
+    'http://localhost:3000', 
+    'http://127.0.0.1:8080',
+    'http://127.0.0.1:3000'
+  ];
+  allowedOrigins = [...new Set([...allowedOrigins, ...localhostOrigins])];
+} else {
+  // In development, allow everything
+  allowedOrigins = '*';
+}
+
+console.log('🔗 CORS Origins:', process.env.NODE_ENV === 'production' ? allowedOrigins : 'All origins (*)');
+
 const corsOptions = {
-  origin: process.env.NODE_ENV === 'production' 
-    ? (process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',') : ['*'])
-    : '*',
+  origin: allowedOrigins,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  credentials: true,
+  optionsSuccessStatus: 200 // Support legacy browsers
 };
 
 // Middleware
@@ -259,7 +279,7 @@ const baseDbConfig = {
     destroyTimeoutMillis: 5000,
     reapIntervalMillis: 1000, // How often to check for idle connections
     createRetryIntervalMillis: 200, // Retry interval for failed connections
-    // validateConnection: true, // Validate connections before use
+    // validateConnection: true, // Removed - not supported in this version
   },
 };
 
@@ -1991,4 +2011,3 @@ async function startServer() {
 app.use(globalErrorHandler);
 
 startServer();
-
